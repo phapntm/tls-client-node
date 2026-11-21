@@ -217,6 +217,11 @@ export interface SessionOptions {
   streamOutputEOFSymbol?: string;
   certificatePinningHosts?: Record<string, string | string[]>;
   transportOptions?: TransportOptions;
+  /**
+   * Default compression offer from the WebSocket bridge to the target (false).
+   * Only applies to GET /api/ws; ignored by HTTP/native requests.
+   */
+  enableCompression?: boolean;
 }
 
 export type RequestBody =
@@ -237,6 +242,48 @@ export interface RequestOptions extends SessionOptions {
   byteResponse?: boolean;
   isByteResponse?: boolean;
   isByteRequest?: boolean;
+}
+
+export type WebSocketData = string | Buffer | ArrayBuffer | ArrayBufferView;
+
+// Wire contract for the tls-client-api `/api/ws` bridge (protocol version 1).
+export interface WebSocketBridgeConfigV1 {
+  version: 1;
+  requestUrl: string;
+  tlsClientIdentifier: string;
+  /** Offer compression from the bridge to the target, not on the local socket. */
+  enableCompression?: boolean;
+  proxyUrl?: string;
+  headers?: Record<string, string | string[]>;
+  headerOrder?: string[];
+  protocols?: string[];
+  handshakeTimeoutMilliseconds?: number;
+  readBufferSize?: number;
+  writeBufferSize?: number;
+  insecureSkipVerify?: boolean;
+  withRandomTLSExtensionOrder?: boolean;
+  disableIPV4?: boolean;
+  disableIPV6?: boolean;
+  serverNameOverwrite?: string;
+}
+
+export interface TLSWebSocketOptions {
+  /** Offer compression from the bridge to the target; inherits the Session default. */
+  enableCompression?: boolean;
+  headers?: HeadersShape;
+  headerOrder?: string[];
+  protocols?: string[];
+  proxyUrl?: string;
+  tlsClientIdentifier?: ClientIdentifier;
+  handshakeTimeoutMilliseconds?: number;
+  readBufferSize?: number;
+  writeBufferSize?: number;
+  insecureSkipVerify?: boolean;
+  withRandomTLSExtensionOrder?: boolean;
+  disableIPV4?: boolean;
+  disableIPV6?: boolean;
+  serverNameOverwrite?: string;
+  bridgeHandshakeTimeoutMilliseconds?: number;
 }
 
 export interface TLSClientOptions {

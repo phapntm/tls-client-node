@@ -4,7 +4,7 @@ import { BinaryInfo, NativeLibraryInfo, TLSClientOptions } from "./types";
 import { TLSClientError } from "./errors";
 
 const TLS_CLIENT_API_RELEASES =
-  "https://api.github.com/repos/bogdanfinn/tls-client-api/releases";
+  "https://api.github.com/repos/phapntm/tls-client-api/releases"; 
 const TLS_CLIENT_RELEASES =
   "https://api.github.com/repos/bogdanfinn/tls-client/releases";
 
@@ -162,7 +162,7 @@ function createHeaders(token?: string): Record<string, string> {
 async function fetchReleaseMetadata(
   releaseBaseUrl: string,
   version: string | undefined,
-  token?: string
+  token?: string 
 ): Promise<any> {
   const url = version && version !== "latest"
     ? `${releaseBaseUrl}/tags/v${normalizeVersion(version)}`
@@ -286,7 +286,7 @@ export async function ensureBinary(
   const metadata = await fetchReleaseMetadata(
     assetSpec.releaseBaseUrl,
     options.version,
-    options.githubToken
+    options.githubToken 
   );
   const version = normalizeVersion(metadata.tag_name ?? options.version ?? "latest");
   const assetName = `${assetSpec.prefix}${version}${assetSpec.suffix}`;

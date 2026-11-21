@@ -363,6 +363,116 @@ const response = await client.request("https://example.com/", {
 });
 ```
 
+## Generic WebSocket
+
+`Session.websocket(url, options)` opens a WebSocket to any remote target through the same `tls-client-api` runtime used for HTTP requests (managed, remote, or rejected outright in native mode). It returns a `TLSWebSocket` immediately in the `CONNECTING` state — you never `await` it — and reuses the owning `Session`'s cookie jar, headers, proxy, and TLS profile by default.
+
+**No Socket.IO or Engine.IO is required for this API.** `TLSWebSocket` is a plain, ws-compatible EventEmitter with DOM-style callbacks on top:
+
+```ts
+import { TLSClient, ClientIdentifier } from "tls-client-node";
+
+const client = new TLSClient();
+const session = client.session({
+  clientIdentifier: ClientIdentifier.chrome_136,
+  proxyUrl: "http://127.0.0.1:40001",
+});
+
+const ws = session.websocket("wss://example.com/ws", {
+  headers: { Origin: "https://example.com" },
+});
+
+ws.on("open", () => ws.send("hello"));
+ws.on("message", (data) => console.log(data));
+ws.on("close", (code, reason) => console.log("closed", code, reason));
+
+// DOM-style callbacks work too:
+ws.onmessage = (event) => console.log(event.data);
+```
+
+### Remote WebSocket compression
+
+`enableCompression` defaults to `false` and controls the compression offer on the connection from the `tls-client-api` bridge to the target WebSocket server:
+
+```ts
+const session = client.session();
+
+const ws = session.websocket("wss://example.com/socket", {
+  enableCompression: true,
+});
+```
+
+Set a session default and override it for individual WebSockets:
+
+```ts
+const session = client.session({ enableCompression: true });
+
+const inherited = session.websocket("wss://example.com/socket");
+
+const uncompressed = session.websocket("wss://example.com/socket", {
+  enableCompression: false,
+});
+```
+
+The per-socket value takes precedence over the session default, including an explicit `false`. With `true`, the backend requests `permessage-deflate` with `server_no_context_takeover` and `client_no_context_takeover`; the target server decides whether to accept compression. Enabling the option does not guarantee that compression is negotiated.
+
+This requires a fork `tls-client-api` binary built with support for `enableCompression` in the version 1 config for the **GET `/api/ws` WebSocket bridge**. It does not apply to the REST WebSocket API (`/api/ws/connect`) or to ordinary HTTP/native requests.
+
+The internal Node.js-to-bridge socket keeps `perMessageDeflate: false`. The client sends the option inside `x-tls-client-ws-config`, does not inject `Sec-WebSocket-Extensions`, and does not compress payloads itself. `TLSWebSocket.extensions` reports extensions on the internal socket; it does not report whether the target server accepted compression.
+
+Notes:
+
+- The local `ws` connection only ever talks to `tls-client-api`'s `/api/ws` bridge; it never connects directly to the remote target. Local `OPEN` means the remote target is already connected, since the bridge guarantees remote-first connection — `TLSWebSocket` never emits a synthetic `open`.
+- Per-call `options` (`headers`, `headerOrder`, `protocols`, `proxyUrl`, `tlsClientIdentifier`, `insecureSkipVerify`, `withRandomTLSExtensionOrder`, `disableIPV4`/`disableIPV6`, `serverNameOverwrite`, `handshakeTimeoutMilliseconds`, `readBufferSize`/`writeBufferSize`) override the `Session`'s defaults, mirroring the equivalent `RequestOptions` fields. The WebSocket-only `enableCompression` option also overrides its session default.
+- Calling `ws.close()` before setup finishes cancels the pending bridge connection cleanly; no connection is ever created and no unhandled rejection is produced.
+- `session.close()` terminates any WebSockets still open on that session.
+- WebSocket subprotocols are supported via `options.protocols`; the negotiated protocol is exposed as `ws.protocol`.
+- Reconnection is intentionally not implemented — that responsibility belongs to whichever higher-level caller uses `TLSWebSocket`.
+
+## Optional Socket.IO / Engine.IO integration
+
+**`tls-client-node` does not implement Socket.IO.** `TLSWebSocketTransport`, exported from the `tls-client-node/socket.io` subpath, is only a thin adapter that lets `engine.io-client`/`socket.io-client` open their WebSocket transport through the generic `Session.websocket()` API above instead of connecting directly:
+
+```
+Socket.IO / Engine.IO
+        |
+        v
+  TLSWebSocketTransport   (optional adapter)
+        |
+        v
+  Session.websocket()     (generic, core)
+```
+
+`engine.io-client` is an optional peer dependency — core WebSocket functionality works without it installed, and importing from `tls-client-node/socket.io` is the only place that package is touched.
+
+```ts
+import { TLSClient, ClientIdentifier } from "tls-client-node";
+import { TLSWebSocketTransport } from "tls-client-node/socket.io";
+import { io } from "socket.io-client";
+
+const client = new TLSClient();
+const session = client.session({
+  clientIdentifier: ClientIdentifier.chrome_136,
+  proxyUrl: "http://127.0.0.1:40001",
+});
+
+const socket = io("https://target.example.com", {
+  transports: [TLSWebSocketTransport],
+  upgrade: false,
+  transportOptions: {
+    websocket: {
+      tlsSession: session,
+      enableCompression: true,
+      extraHeaders: { Origin: "https://target.example.com" },
+    },
+  },
+});
+```
+
+`transportOptions.websocket.enableCompression` controls bridge-to-target compression through `Session.websocket()`. Omit it to inherit the session default, or pass `false` to override a session default of `true`. Engine.IO's `perMessageDeflate` option does not control this remote compression offer.
+
+`TLSWebSocketTransport` contains no proxy, TLS profile, cookie jar, or runtime management logic of its own — all of that stays on `Session`, and it never implements Socket.IO/Engine.IO protocol concerns (parsing, heartbeats, acks, namespaces, reconnection); those remain Socket.IO's responsibility.
+
 ## Notes
 
 - Primary interface: create a `TLSClient`, create one or more `Session` instances, and stop the client when finished.
@@ -371,7 +481,6 @@ const response = await client.request("https://example.com/", {
 - Binary responses are returned as a data URL when `byteResponse: true` is enabled, matching upstream behavior.
 - `FormData`, `MultipartForm`, and `createMultipartForm()` can all be used for multipart uploads, with the generated boundary preserved in the `content-type` header.
 - `redirect` is a higher-level alias over `followRedirects`; it improves call-site clarity without changing upstream redirect semantics.
-- WebSocket upgrade and frame APIs are not currently implemented in this wrapper.
 - New upstream client identifiers can be passed as plain strings even before this package adds them to `ClientIdentifier`.
 - Custom TLS requests remain custom-only. Rejections such as `tls: illegal parameter` or `unknown ClientHelloID: Custom-1` throw `ERR_CUSTOM_TLS_REJECTED` instead of falling back silently.
 - If `certCompressionAlgo` is provided, it is normalized to the upstream `certCompressionAlgos` field before the request is sent.

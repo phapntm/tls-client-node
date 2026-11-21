@@ -1,14 +1,30 @@
 import { randomBytes, randomUUID } from "crypto";
-import { access, chmod, copyFile, mkdir, open, readFile, rm, unlink, writeFile } from "fs/promises";
+import {
+  access,
+  chmod,
+  copyFile,
+  mkdir,
+  open,
+  readFile,
+  rm,
+  unlink,
+  writeFile,
+} from "fs/promises";
 import { homedir } from "os";
 import path from "path";
 import { spawn, ChildProcess } from "child_process";
 import net from "net";
+import WebSocket from "ws";
 import { CookieJar, type Cookie as ToughCookie } from "tough-cookie";
 import { ensureBinary, supportsNativeRuntime, writeConfigFile } from "./binary";
 import { TLSClientError } from "./errors";
 import { ensureNativeBinding, NativeClientBinding } from "./native";
 import { TLSResponse } from "./response";
+import {
+  buildBridgeWebSocketUrl,
+  encodeWebSocketBridgeConfig,
+  TLSWebSocket,
+} from "./websocket";
 import {
   ApiResponsePayload,
   ClientIdentifier,
@@ -25,6 +41,8 @@ import {
   SerializedCookieJar,
   SessionOptions,
   TLSClientOptions,
+  TLSWebSocketOptions,
+  WebSocketBridgeConfigV1,
 } from "./types";
 
 interface RuntimeState {
@@ -70,7 +88,7 @@ function normalizeHeaders(headers?: HeadersShape): Record<string, string> {
 
 function mergeHeaders(
   base?: HeadersShape,
-  override?: HeadersShape
+  override?: HeadersShape,
 ): Record<string, string> {
   return {
     ...normalizeHeaders(base),
@@ -79,7 +97,7 @@ function mergeHeaders(
 }
 
 function normalizeCookieInput(
-  cookies?: Cookie[] | Record<string, string>
+  cookies?: Cookie[] | Record<string, string>,
 ): Cookie[] {
   if (!cookies) {
     return [];
@@ -93,9 +111,8 @@ function normalizeCookieInput(
 }
 
 function formatCookieExpires(expires: string | number): string {
-  const parsedDate = typeof expires === "number"
-    ? new Date(expires * 1000)
-    : new Date(expires);
+  const parsedDate =
+    typeof expires === "number" ? new Date(expires * 1000) : new Date(expires);
 
   return Number.isNaN(parsedDate.getTime())
     ? String(expires)
@@ -103,7 +120,7 @@ function formatCookieExpires(expires: string | number): string {
 }
 
 function normalizeCookieExpiresForRuntime(
-  expires?: string | number
+  expires?: string | number,
 ): number | undefined {
   if (expires === undefined) {
     return undefined;
@@ -116,13 +133,11 @@ function normalizeCookieExpiresForRuntime(
   const parsedDate = new Date(expires);
   const timestamp = parsedDate.getTime();
 
-  return Number.isNaN(timestamp)
-    ? undefined
-    : Math.trunc(timestamp / 1000);
+  return Number.isNaN(timestamp) ? undefined : Math.trunc(timestamp / 1000);
 }
 
 function normalizeCookiesForRuntime(
-  cookies?: Cookie[] | Record<string, string>
+  cookies?: Cookie[] | Record<string, string>,
 ): Cookie[] {
   return normalizeCookieInput(cookies).map((cookie) => ({
     ...cookie,
@@ -163,7 +178,7 @@ function buildCookieJarString(cookie: Cookie): string {
 async function syncCookiesToJar(
   cookieJar: CookieJar,
   cookies: Cookie[] | Record<string, string> | undefined | null,
-  url: string
+  url: string,
 ): Promise<void> {
   const normalizedCookies = normalizeCookieInput(cookies ?? undefined);
 
@@ -172,7 +187,7 @@ async function syncCookiesToJar(
       await cookieJar.setCookie(buildCookieJarString(cookie), url, {
         ignoreError: true,
       });
-    })
+    }),
   );
 }
 
@@ -182,26 +197,30 @@ function normalizeJarCookie(cookie: ToughCookie): Cookie {
     value: cookie.value,
     domain: cookie.domain ?? undefined,
     path: cookie.path ?? undefined,
-    expires: cookie.expires instanceof Date
-      ? cookie.expires.toISOString()
-      : cookie.expires === "Infinity"
-        ? undefined
-        : typeof cookie.expires === "string"
-        ? cookie.expires
-        : undefined,
+    expires:
+      cookie.expires instanceof Date
+        ? cookie.expires.toISOString()
+        : cookie.expires === "Infinity"
+          ? undefined
+          : typeof cookie.expires === "string"
+            ? cookie.expires
+            : undefined,
     maxAge: typeof cookie.maxAge === "number" ? cookie.maxAge : undefined,
     secure: cookie.secure,
     httpOnly: cookie.httpOnly,
   };
 }
 
-async function getCookiesFromJar(cookieJar: CookieJar, url: string): Promise<Cookie[]> {
+async function getCookiesFromJar(
+  cookieJar: CookieJar,
+  url: string,
+): Promise<Cookie[]> {
   const jarCookies = await cookieJar.getCookies(url);
   return jarCookies.map((cookie) => normalizeJarCookie(cookie));
 }
 
 function normalizeCertificatePinningHosts(
-  value?: Record<string, string | string[]>
+  value?: Record<string, string | string[]>,
 ): Record<string, string[]> {
   if (!value) {
     return {};
@@ -250,13 +269,16 @@ function isPositiveInteger(value: number): boolean {
 // Resolves the managed runtime slot ceiling: per-client option first, then the
 // TLS_CLIENT_RUNTIME_SLOTS env override, then the built-in default.
 function resolveRuntimeSlotCount(options: TLSClientOptions): number {
-  if (options.runtimeSlots !== undefined && isPositiveInteger(options.runtimeSlots)) {
+  if (
+    options.runtimeSlots !== undefined &&
+    isPositiveInteger(options.runtimeSlots)
+  ) {
     return options.runtimeSlots;
   }
 
   const envOverride = Number.parseInt(
     process.env.TLS_CLIENT_RUNTIME_SLOTS ?? "",
-    10
+    10,
   );
 
   return isPositiveInteger(envOverride)
@@ -265,7 +287,9 @@ function resolveRuntimeSlotCount(options: TLSClientOptions): number {
 }
 
 function isManagedRuntimePortConflict(output: string): boolean {
-  return MANAGED_RUNTIME_PORT_CONFLICT_PATTERNS.some((pattern) => pattern.test(output));
+  return MANAGED_RUNTIME_PORT_CONFLICT_PATTERNS.some((pattern) =>
+    pattern.test(output),
+  );
 }
 
 function cloneStringArray(value?: string[]): string[] | undefined {
@@ -273,7 +297,7 @@ function cloneStringArray(value?: string[]): string[] | undefined {
 }
 
 function normalizeCustomTlsClient(
-  value?: CustomTlsClient
+  value?: CustomTlsClient,
 ): CustomTlsClient | undefined {
   if (!value) {
     return undefined;
@@ -318,9 +342,11 @@ function normalizeCustomTlsClient(
     h3PseudoHeaderOrder: cloneStringArray(h3PseudoHeaderOrder),
     headerPriority: headerPriority ? { ...headerPriority } : headerPriority,
     certCompressionAlgos: normalizedCertCompressionAlgos,
-    supportedSignatureAlgorithms: cloneStringArray(supportedSignatureAlgorithms),
+    supportedSignatureAlgorithms: cloneStringArray(
+      supportedSignatureAlgorithms,
+    ),
     supportedDelegatedCredentialsAlgorithms: cloneStringArray(
-      supportedDelegatedCredentialsAlgorithms
+      supportedDelegatedCredentialsAlgorithms,
     ),
     supportedVersions: cloneStringArray(supportedVersions),
     keyShareCurves: cloneStringArray(keyShareCurves),
@@ -359,7 +385,7 @@ function normalizeHostOverride(value?: string | null): string | undefined {
 }
 
 function normalizeRedirectBehavior(
-  value?: RedirectBehavior
+  value?: RedirectBehavior,
 ): boolean | undefined {
   if (value === undefined) {
     return undefined;
@@ -383,7 +409,7 @@ function isFormDataBody(body: RequestBody): body is FormData {
 async function encodeBody(
   body: RequestBody,
   headers: Record<string, string>,
-  forceBinary?: boolean
+  forceBinary?: boolean,
 ): Promise<{ requestBody?: string; isByteRequest: boolean }> {
   const normalizedBody = isMultipartBodyLike(body) ? body.toFormData() : body;
 
@@ -403,7 +429,8 @@ async function encodeBody(
 
   if (normalizedBody instanceof URLSearchParams) {
     if (!headers["content-type"]) {
-      headers["content-type"] = "application/x-www-form-urlencoded;charset=UTF-8";
+      headers["content-type"] =
+        "application/x-www-form-urlencoded;charset=UTF-8";
     }
 
     return {
@@ -430,10 +457,18 @@ async function encodeBody(
     };
   }
 
-  if (normalizedBody instanceof ArrayBuffer || ArrayBuffer.isView(normalizedBody)) {
-    const buffer = normalizedBody instanceof ArrayBuffer
-      ? Buffer.from(normalizedBody)
-      : Buffer.from(normalizedBody.buffer, normalizedBody.byteOffset, normalizedBody.byteLength);
+  if (
+    normalizedBody instanceof ArrayBuffer ||
+    ArrayBuffer.isView(normalizedBody)
+  ) {
+    const buffer =
+      normalizedBody instanceof ArrayBuffer
+        ? Buffer.from(normalizedBody)
+        : Buffer.from(
+            normalizedBody.buffer,
+            normalizedBody.byteOffset,
+            normalizedBody.byteLength,
+          );
 
     if (!headers["content-type"]) {
       headers["content-type"] = "application/octet-stream";
@@ -455,6 +490,8 @@ async function encodeBody(
   };
 }
 
+function pickDefined<T>(...values: [...Array<T | undefined>, T]): T;
+function pickDefined<T>(...values: Array<T | undefined>): T | undefined;
 function pickDefined<T>(...values: Array<T | undefined>): T | undefined {
   for (const value of values) {
     if (value !== undefined) {
@@ -480,7 +517,7 @@ function describeTarget(url: string): string {
 
 function getProfileSelection(
   sessionDefaults: SessionOptions | undefined,
-  requestOptions: RequestOptions
+  requestOptions: RequestOptions,
 ): {
   customTlsClient?: CustomTlsClient;
   tlsClientIdentifier?: ClientIdentifier;
@@ -490,15 +527,15 @@ function getProfileSelection(
       requestOptions.customTlsClient,
       normalizeJa3String(requestOptions.ja3string),
       sessionDefaults?.customTlsClient,
-      normalizeJa3String(sessionDefaults?.ja3string)
-    )
+      normalizeJa3String(sessionDefaults?.ja3string),
+    ),
   );
 
   const explicitTlsClientIdentifier = pickDefined(
     requestOptions.tlsClientIdentifier,
     requestOptions.clientIdentifier,
     sessionDefaults?.tlsClientIdentifier,
-    sessionDefaults?.clientIdentifier
+    sessionDefaults?.clientIdentifier,
   );
 
   if (customTlsClient && explicitTlsClientIdentifier !== undefined) {
@@ -510,7 +547,7 @@ function getProfileSelection(
           tlsClientIdentifier: explicitTlsClientIdentifier,
           customTlsClient,
         },
-      }
+      },
     );
   }
 
@@ -526,25 +563,28 @@ async function buildForwardPayload(
   url: string,
   sessionDefaults: SessionOptions | undefined,
   requestOptions: RequestOptions,
-  sessionId?: string
+  sessionId?: string,
 ) {
-  const headers = mergeHeaders(sessionDefaults?.headers, requestOptions.headers);
+  const headers = mergeHeaders(
+    sessionDefaults?.headers,
+    requestOptions.headers,
+  );
   const profileSelection = getProfileSelection(sessionDefaults, requestOptions);
   const timeoutMilliseconds = pickDefined(
     requestOptions.timeoutMilliseconds,
     requestOptions.timeout,
     sessionDefaults?.timeoutMilliseconds,
-    sessionDefaults?.timeout
+    sessionDefaults?.timeout,
   );
   const timeoutSeconds = pickDefined(
     requestOptions.timeoutSeconds,
     sessionDefaults?.timeoutSeconds,
-    timeoutMilliseconds !== undefined ? 0 : 30
+    timeoutMilliseconds !== undefined ? 0 : 30,
   );
   const { requestBody, isByteRequest } = await encodeBody(
     requestOptions.body,
     headers,
-    requestOptions.isByteRequest
+    requestOptions.isByteRequest,
   );
 
   return {
@@ -559,29 +599,29 @@ async function buildForwardPayload(
       requestOptions.followRedirects,
       normalizeRedirectBehavior(sessionDefaults?.redirect),
       sessionDefaults?.followRedirects,
-      false
+      false,
     ),
     insecureSkipVerify: pickDefined(
       requestOptions.insecureSkipVerify,
       sessionDefaults?.insecureSkipVerify,
-      false
+      false,
     ),
     withoutCookieJar: pickDefined(
       requestOptions.withoutCookieJar,
       sessionDefaults?.withoutCookieJar,
-      false
+      false,
     ),
     withCustomCookieJar: pickDefined(
       requestOptions.withCustomCookieJar,
       sessionDefaults?.withCustomCookieJar,
-      false
+      false,
     ),
     withRandomTLSExtensionOrder: pickDefined(
       requestOptions.withRandomTLSExtensionOrder,
       requestOptions.randomTlsExtensionOrder,
       sessionDefaults?.withRandomTLSExtensionOrder,
       sessionDefaults?.randomTlsExtensionOrder,
-      false
+      false,
     ),
     timeoutSeconds,
     timeoutMilliseconds: timeoutMilliseconds ?? 0,
@@ -591,105 +631,105 @@ async function buildForwardPayload(
       requestOptions.proxy,
       sessionDefaults?.proxyUrl,
       sessionDefaults?.proxy,
-      ""
+      "",
     ),
     isRotatingProxy: pickDefined(
       requestOptions.isRotatingProxy,
       sessionDefaults?.isRotatingProxy,
-      false
+      false,
     ),
     forceHttp1: pickDefined(
       requestOptions.forceHttp1,
       sessionDefaults?.forceHttp1,
-      false
+      false,
     ),
     disableHttp3: pickDefined(
       requestOptions.disableHttp3,
       sessionDefaults?.disableHttp3,
-      false
+      false,
     ),
     withProtocolRacing: pickDefined(
       requestOptions.withProtocolRacing,
       sessionDefaults?.withProtocolRacing,
-      false
+      false,
     ),
     withDebug: pickDefined(
       requestOptions.withDebug,
       requestOptions.debug,
       sessionDefaults?.withDebug,
       sessionDefaults?.debug,
-      false
+      false,
     ),
     catchPanics: pickDefined(
       requestOptions.catchPanics,
       sessionDefaults?.catchPanics,
-      false
+      false,
     ),
     isByteRequest,
     isByteResponse: pickDefined(
       requestOptions.isByteResponse,
       requestOptions.byteResponse,
-      false
+      false,
     ),
     disableIPV6: pickDefined(
       requestOptions.disableIPV6,
       sessionDefaults?.disableIPV6,
-      false
+      false,
     ),
     disableIPV4: pickDefined(
       requestOptions.disableIPV4,
       sessionDefaults?.disableIPV4,
-      false
+      false,
     ),
     certificatePinningHosts: normalizeCertificatePinningHosts(
       pickDefined(
         requestOptions.certificatePinningHosts,
-        sessionDefaults?.certificatePinningHosts
-      )
+        sessionDefaults?.certificatePinningHosts,
+      ),
     ),
     transportOptions: pickDefined(
       requestOptions.transportOptions,
-      sessionDefaults?.transportOptions
+      sessionDefaults?.transportOptions,
     ),
     headers,
     defaultHeaders: pickDefined(
       requestOptions.defaultHeaders,
-      sessionDefaults?.defaultHeaders
+      sessionDefaults?.defaultHeaders,
     ),
     connectHeaders: pickDefined(
       requestOptions.connectHeaders,
-      sessionDefaults?.connectHeaders
+      sessionDefaults?.connectHeaders,
     ),
     headerOrder: pickDefined(
       requestOptions.headerOrder,
       sessionDefaults?.headerOrder,
-      Object.keys(headers)
+      Object.keys(headers),
     ),
     localAddress: pickDefined(
       requestOptions.localAddress,
-      sessionDefaults?.localAddress
+      sessionDefaults?.localAddress,
     ),
     serverNameOverwrite: pickDefined(
       requestOptions.serverNameOverwrite,
-      sessionDefaults?.serverNameOverwrite
+      sessionDefaults?.serverNameOverwrite,
     ),
     requestHostOverride: pickDefined(
       requestOptions.requestHostOverride,
       normalizeHostOverride(requestOptions.hostOverride),
-      sessionDefaults?.requestHostOverride
-      , normalizeHostOverride(sessionDefaults?.hostOverride)
+      sessionDefaults?.requestHostOverride,
+      normalizeHostOverride(sessionDefaults?.hostOverride),
     ),
     streamOutputPath: pickDefined(
       requestOptions.streamOutputPath,
-      sessionDefaults?.streamOutputPath
+      sessionDefaults?.streamOutputPath,
     ),
     streamOutputBlockSize: pickDefined(
       requestOptions.streamOutputBlockSize,
-      sessionDefaults?.streamOutputBlockSize
+      sessionDefaults?.streamOutputBlockSize,
     ),
     streamOutputEOFSymbol: pickDefined(
       requestOptions.streamOutputEOFSymbol,
-      sessionDefaults?.streamOutputEOFSymbol
+      sessionDefaults?.streamOutputEOFSymbol,
     ),
   };
 }
@@ -698,7 +738,7 @@ type ForwardPayload = Awaited<ReturnType<typeof buildForwardPayload>>;
 
 function classifyForwardError(
   value: unknown,
-  payload: ForwardPayload
+  payload: ForwardPayload,
 ): TLSClientError {
   const error = TLSClientError.fromUnknown(value);
   const target = describeTarget(payload.requestUrl);
@@ -718,7 +758,7 @@ function classifyForwardError(
           sessionId: payload.sessionId,
           customTlsClient: payload.customTlsClient,
         },
-      }
+      },
     );
   }
 
@@ -735,7 +775,7 @@ function classifyForwardError(
           sessionId: payload.sessionId,
           customTlsClient: Boolean(payload.customTlsClient),
         },
-      }
+      },
     );
   }
 
@@ -746,7 +786,11 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function appendBoundedLog(current: string, chunk: Buffer | string, maxLength = 16_384): string {
+function appendBoundedLog(
+  current: string,
+  chunk: Buffer | string,
+  maxLength = 16_384,
+): string {
   const next = current + chunk.toString();
   return next.length <= maxLength ? next : next.slice(-maxLength);
 }
@@ -786,19 +830,25 @@ function getRuntimeRootDirectory(options: TLSClientOptions): string {
   }
 
   if (process.platform === "win32") {
-    const localAppData = process.env.LOCALAPPDATA
-      ?? path.join(homedir(), "AppData", "Local");
+    const localAppData =
+      process.env.LOCALAPPDATA ?? path.join(homedir(), "AppData", "Local");
     return path.join(localAppData, "tls-client-node", "runtime");
   }
 
   if (process.platform === "darwin") {
-    return path.join(homedir(), "Library", "Caches", "tls-client-node", "runtime");
+    return path.join(
+      homedir(),
+      "Library",
+      "Caches",
+      "tls-client-node",
+      "runtime",
+    );
   }
 
   return path.join(
     process.env.XDG_CACHE_HOME ?? path.join(homedir(), ".cache"),
     "tls-client-node",
-    "runtime"
+    "runtime",
   );
 }
 
@@ -839,7 +889,7 @@ async function claimRuntimeLock(lockFilePath: string): Promise<boolean> {
   try {
     const existingPid = Number.parseInt(
       (await readFile(lockFilePath, "utf8")).trim(),
-      10
+      10,
     );
 
     if (isProcessAlive(existingPid)) {
@@ -869,7 +919,7 @@ async function claimRuntimeLock(lockFilePath: string): Promise<boolean> {
 async function prepareRuntimeSlot(
   options: TLSClientOptions,
   executablePath: string,
-  version: string
+  version: string,
 ): Promise<{
   runtimeDir: string;
   runtimeExecutablePath: string;
@@ -877,12 +927,15 @@ async function prepareRuntimeSlot(
 }> {
   if (process.platform === "win32" && !options.runtimeDir) {
     const runtimeDir = path.dirname(executablePath);
-    const lockFilePath = path.join(runtimeDir, `.${path.basename(executablePath)}.lock`);
+    const lockFilePath = path.join(
+      runtimeDir,
+      `.${path.basename(executablePath)}.lock`,
+    );
 
     if (!(await claimRuntimeLock(lockFilePath))) {
       throw new TLSClientError(
         "The managed tls-client-api Windows runtime is already in use.",
-        { code: "ERR_RUNTIME_SLOT_UNAVAILABLE" }
+        { code: "ERR_RUNTIME_SLOT_UNAVAILABLE" },
       );
     }
 
@@ -935,7 +988,7 @@ async function prepareRuntimeSlot(
 
   throw new TLSClientError(
     `Unable to allocate a tls-client runtime slot after checking ${slotCount} slots.`,
-    { code: "ERR_RUNTIME_SLOT_UNAVAILABLE" }
+    { code: "ERR_RUNTIME_SLOT_UNAVAILABLE" },
   );
 }
 
@@ -1003,7 +1056,8 @@ function claimPort(port: number): Promise<number> {
 export class TLSClient {
   private readonly options: Required<
     Pick<TLSClientOptions, "requestTimeoutMs" | "startupTimeoutMs">
-  > & TLSClientOptions;
+  > &
+    TLSClientOptions;
   private startPromise?: Promise<void>;
   private runtime?: RuntimeState;
 
@@ -1055,13 +1109,13 @@ export class TLSClient {
 
   public async request(
     url: string,
-    options: RequestOptions = {}
+    options: RequestOptions = {},
   ): Promise<TLSResponse> {
     const payload = await buildForwardPayload(
       url,
       undefined,
       options,
-      options.sessionId
+      options.sessionId,
     );
     return this.forward(payload);
   }
@@ -1071,10 +1125,12 @@ export class TLSClient {
     const runtime = this.getRuntime();
 
     if (runtime.mode === "native") {
-      return (await runtime.native!.getCookiesFromSession<CookiesOutput>({
-        sessionId,
-        url,
-      })).cookies;
+      return (
+        await runtime.native!.getCookiesFromSession<CookiesOutput>({
+          sessionId,
+          url,
+        })
+      ).cookies;
     }
 
     const response = await this.requestJson<CookiesOutput>("/api/cookies", {
@@ -1116,11 +1172,33 @@ export class TLSClient {
     if (!response.ok) {
       throw new TLSClientError(
         `tls-client-api free-all failed with ${response.status} ${response.statusText}`,
-        { code: "ERR_API_REQUEST", status: response.status }
+        { code: "ERR_API_REQUEST", status: response.status },
       );
     }
 
     return (await response.json()) as DestroyOutput;
+  }
+
+  // Lazily starts (or reuses) the managed/remote runtime so a WebSocket can
+  // be the very first thing that triggers runtime startup.
+  public async ensureWebSocketBridge(): Promise<{
+    baseUrl: string;
+    apiKey: string;
+  }> {
+    await this.start();
+    const runtime = this.getRuntime();
+
+    if (runtime.mode === "native") {
+      throw new TLSClientError(
+        "WebSocket bridging is not supported in native-library mode. Use managed or remote runtime mode instead.",
+        { code: "ERR_UNSUPPORTED_RUNTIME_OPERATION" },
+      );
+    }
+
+    return {
+      baseUrl: runtime.baseUrl!,
+      apiKey: runtime.apiKey ?? "",
+    };
   }
 
   private async startInternal(): Promise<void> {
@@ -1145,15 +1223,25 @@ export class TLSClient {
     const apiKey = this.options.apiKey ?? randomBytes(16).toString("hex");
     let lastStartupError: TLSClientError | undefined;
 
-    for (let attempt = 0; attempt < MANAGED_RUNTIME_START_RETRIES; attempt += 1) {
+    for (
+      let attempt = 0;
+      attempt < MANAGED_RUNTIME_START_RETRIES;
+      attempt += 1
+    ) {
       const port = await findAvailablePort(this.options.port);
       const healthPort = await findAvailablePort(this.options.healthPort);
-      const { runtimeDir, runtimeExecutablePath, lockFilePath } = await prepareRuntimeSlot(
-        this.options,
-        binary.executablePath,
-        binary.version
+      const { runtimeDir, runtimeExecutablePath, lockFilePath } =
+        await prepareRuntimeSlot(
+          this.options,
+          binary.executablePath,
+          binary.version,
+        );
+      const configFilePath = await writeConfigFile(
+        runtimeDir,
+        port,
+        healthPort,
+        apiKey,
       );
-      const configFilePath = await writeConfigFile(runtimeDir, port, healthPort, apiKey);
 
       const child = spawn(runtimeExecutablePath, [], {
         stdio: ["ignore", "pipe", "pipe"],
@@ -1219,14 +1307,14 @@ export class TLSClient {
             : exitCode !== null || exitSignal !== null
               ? `tls-client-api failed to start (exit code: ${exitCode ?? "null"}, signal: ${exitSignal ?? "null"}).`
               : "tls-client-api failed to start.",
-          { code: "ERR_STARTUP", cause: error }
+          { code: "ERR_STARTUP", cause: error },
         );
 
         lastStartupError = startupError;
 
         if (
-          attempt + 1 < MANAGED_RUNTIME_START_RETRIES
-          && isManagedRuntimePortConflict(startupOutput)
+          attempt + 1 < MANAGED_RUNTIME_START_RETRIES &&
+          isManagedRuntimePortConflict(startupOutput)
         ) {
           continue;
         }
@@ -1235,9 +1323,12 @@ export class TLSClient {
       }
     }
 
-    throw lastStartupError ?? new TLSClientError("tls-client-api failed to start.", {
-      code: "ERR_STARTUP",
-    });
+    throw (
+      lastStartupError ??
+      new TLSClientError("tls-client-api failed to start.", {
+        code: "ERR_STARTUP",
+      })
+    );
   }
 
   private async waitUntilReady(): Promise<void> {
@@ -1255,9 +1346,12 @@ export class TLSClient {
       }
     }
 
-    throw new TLSClientError("Timed out waiting for tls-client-api to become ready.", {
-      code: "ERR_STARTUP_TIMEOUT",
-    });
+    throw new TLSClientError(
+      "Timed out waiting for tls-client-api to become ready.",
+      {
+        code: "ERR_STARTUP_TIMEOUT",
+      },
+    );
   }
 
   private getRuntime(): RuntimeState {
@@ -1277,9 +1371,10 @@ export class TLSClient {
     let response: ApiResponsePayload;
 
     try {
-      response = runtime.mode === "native"
-        ? await runtime.native!.request<ApiResponsePayload>(payload)
-        : await this.requestJson<ApiResponsePayload>("/api/forward", payload);
+      response =
+        runtime.mode === "native"
+          ? await runtime.native!.request<ApiResponsePayload>(payload)
+          : await this.requestJson<ApiResponsePayload>("/api/forward", payload);
     } catch (error) {
       throw classifyForwardError(error, payload);
     }
@@ -1290,7 +1385,7 @@ export class TLSClient {
           code: "ERR_FORWARD_REQUEST",
           details: response,
         }),
-        payload
+        payload,
       );
     }
 
@@ -1301,21 +1396,24 @@ export class TLSClient {
     pathName: string,
     body: unknown,
     method = "POST",
-    endpointOverride?: string
+    endpointOverride?: string,
   ): Promise<T> {
     await this.start();
     const runtime = this.getRuntime();
     if (runtime.mode === "native") {
       throw new TLSClientError(
         `The ${pathName} endpoint is not available in native-library mode.`,
-        { code: "ERR_UNSUPPORTED_RUNTIME_OPERATION" }
+        { code: "ERR_UNSUPPORTED_RUNTIME_OPERATION" },
       );
     }
 
     const apiKey = runtime.apiKey ?? "";
     const endpoint = endpointOverride ?? pathName;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.options.requestTimeoutMs);
+    const timer = setTimeout(
+      () => controller.abort(),
+      this.options.requestTimeoutMs,
+    );
 
     try {
       const response = await globalThis.fetch(`${runtime.baseUrl}${endpoint}`, {
@@ -1332,7 +1430,7 @@ export class TLSClient {
         const text = await response.text();
         throw new TLSClientError(
           `tls-client-api request failed with ${response.status} ${response.statusText}: ${text}`,
-          { code: "ERR_API_REQUEST", status: response.status }
+          { code: "ERR_API_REQUEST", status: response.status },
         );
       }
 
@@ -1347,11 +1445,12 @@ export class TLSClient {
     } catch (error) {
       if (
         error instanceof Error &&
-        (error.name === "AbortError" || (error as NodeJS.ErrnoException).code === "ABORT_ERR")
+        (error.name === "AbortError" ||
+          (error as NodeJS.ErrnoException).code === "ABORT_ERR")
       ) {
         throw new TLSClientError(
           `tls-client-api request timed out after ${this.options.requestTimeoutMs}ms`,
-          { code: "ERR_REQUEST_TIMEOUT", retriable: true }
+          { code: "ERR_REQUEST_TIMEOUT", retriable: true },
         );
       }
       throw TLSClientError.fromUnknown(error, { code: "ERR_API_REQUEST" });
@@ -1366,10 +1465,11 @@ export class Session {
   public readonly cookieJar: CookieJar;
   private closed = false;
   private closePromise?: Promise<void>;
+  private readonly activeWebSockets = new Set<TLSWebSocket>();
 
   constructor(
     private readonly client: TLSClient,
-    private readonly defaults: SessionOptions = {}
+    private readonly defaults: SessionOptions = {},
   ) {
     this.id = defaults.sessionId ?? randomUUID();
     this.cookieJar = defaults.cookieJar ?? new CookieJar();
@@ -1377,13 +1477,13 @@ export class Session {
 
   public async request(
     url: string,
-    options: RequestOptions = {}
+    options: RequestOptions = {},
   ): Promise<TLSResponse> {
     this.assertOpen();
     const useLocalCookieJar = !pickDefined(
       options.withoutCookieJar,
       this.defaults.withoutCookieJar,
-      false
+      false,
     );
 
     if (useLocalCookieJar) {
@@ -1401,7 +1501,7 @@ export class Session {
         ...options,
         cookies: requestCookies,
       },
-      this.id
+      this.id,
     );
     const response = await this.client.forward(payload);
 
@@ -1424,11 +1524,17 @@ export class Session {
     return this.request(url, { ...options, method: "PUT" });
   }
 
-  public patch(url: string, options: RequestOptions = {}): Promise<TLSResponse> {
+  public patch(
+    url: string,
+    options: RequestOptions = {},
+  ): Promise<TLSResponse> {
     return this.request(url, { ...options, method: "PATCH" });
   }
 
-  public delete(url: string, options: RequestOptions = {}): Promise<TLSResponse> {
+  public delete(
+    url: string,
+    options: RequestOptions = {},
+  ): Promise<TLSResponse> {
     return this.request(url, { ...options, method: "DELETE" });
   }
 
@@ -1438,9 +1544,144 @@ export class Session {
 
   public options(
     url: string,
-    requestOptions: RequestOptions = {}
+    requestOptions: RequestOptions = {},
   ): Promise<TLSResponse> {
     return this.request(url, { ...requestOptions, method: "OPTIONS" });
+  }
+
+  // Returns a TLSWebSocket immediately in CONNECTING state. Setup (runtime
+  // startup, cookie jar lookup, bridge config) happens asynchronously so
+  // callers never need to `await` this call.
+  public websocket(
+    url: string,
+    options: TLSWebSocketOptions = {},
+  ): TLSWebSocket {
+    this.assertOpen();
+
+    const tlsWebSocket = new TLSWebSocket(url, async ({ isCancelled }) => {
+      const useLocalCookieJar = !pickDefined(
+        this.defaults.withoutCookieJar,
+        false,
+      );
+      const headers = mergeHeaders(this.defaults.headers, options.headers);
+
+      if (useLocalCookieJar && !headers["cookie"]) {
+        const jarCookies = await getCookiesFromJar(this.cookieJar, url);
+        const cookieHeader = jarCookies
+          .map((cookie) => `${cookie.name}=${cookie.value}`)
+          .join("; ");
+
+        if (cookieHeader) {
+          headers["cookie"] = cookieHeader;
+        }
+      }
+
+      if (isCancelled()) {
+        throw new TLSClientError(
+          "WebSocket setup cancelled before completion.",
+          {
+            code: "ERR_WS_CANCELLED",
+          },
+        );
+      }
+
+      const bridge = await this.client.ensureWebSocketBridge();
+
+      if (isCancelled()) {
+        throw new TLSClientError(
+          "WebSocket setup cancelled before completion.",
+          {
+            code: "ERR_WS_CANCELLED",
+          },
+        );
+      }
+
+      const config: WebSocketBridgeConfigV1 = {
+        version: 1,
+        requestUrl: url,
+        tlsClientIdentifier: pickDefined(
+          options.tlsClientIdentifier,
+          this.defaults.tlsClientIdentifier,
+          this.defaults.clientIdentifier,
+          ClientIdentifier.chrome_136,
+        ),
+        proxyUrl: pickDefined(
+          options.proxyUrl,
+          this.defaults.proxyUrl,
+          this.defaults.proxy,
+        ),
+        headers,
+        headerOrder: pickDefined(
+          options.headerOrder,
+          this.defaults.headerOrder,
+          Object.keys(headers),
+        ),
+        protocols: options.protocols,
+        enableCompression: pickDefined(
+          options.enableCompression,
+          this.defaults.enableCompression,
+          false,
+        ),
+        handshakeTimeoutMilliseconds: options.handshakeTimeoutMilliseconds,
+        readBufferSize: options.readBufferSize,
+        writeBufferSize: options.writeBufferSize,
+        insecureSkipVerify: pickDefined(
+          options.insecureSkipVerify,
+          this.defaults.insecureSkipVerify,
+        ),
+        withRandomTLSExtensionOrder: pickDefined(
+          options.withRandomTLSExtensionOrder,
+          this.defaults.withRandomTLSExtensionOrder,
+          this.defaults.randomTlsExtensionOrder,
+        ),
+        disableIPV4: pickDefined(
+          options.disableIPV4,
+          this.defaults.disableIPV4,
+        ),
+        disableIPV6: pickDefined(
+          options.disableIPV6,
+          this.defaults.disableIPV6,
+        ),
+        serverNameOverwrite: pickDefined(
+          options.serverNameOverwrite,
+          this.defaults.serverNameOverwrite,
+        ),
+      };
+
+      if (isCancelled()) {
+        throw new TLSClientError(
+          "WebSocket setup cancelled before completion.",
+          {
+            code: "ERR_WS_CANCELLED",
+          },
+        );
+      }
+
+      // Only bridge-specific headers go on the local connection; remote
+      // headers (Origin, Cookie, Authorization, ...) live inside the config.
+      const socket = new WebSocket(
+        buildBridgeWebSocketUrl(bridge.baseUrl),
+        options.protocols,
+        {
+          headers: {
+            "x-api-key": bridge.apiKey,
+            "x-tls-client-ws-config": encodeWebSocketBridgeConfig(config),
+          },
+          // Remote compression is controlled by the bridge config above.
+          perMessageDeflate: false,
+          handshakeTimeout: options.bridgeHandshakeTimeoutMilliseconds,
+        },
+      );
+
+      return { socket };
+    });
+
+    this.activeWebSockets.add(tlsWebSocket);
+    tlsWebSocket.once("close", () => {
+      this.activeWebSockets.delete(tlsWebSocket);
+    });
+
+    return tlsWebSocket;
   }
 
   public async cookies(url: string): Promise<Cookie[]> {
@@ -1465,7 +1706,14 @@ export class Session {
     }
 
     this.closed = true;
-    this.closePromise = this.client.destroySession(this.id)
+
+    for (const activeWebSocket of this.activeWebSockets) {
+      activeWebSocket.terminate();
+    }
+    this.activeWebSockets.clear();
+
+    this.closePromise = this.client
+      .destroySession(this.id)
       .then(() => undefined)
       .catch((error) => {
         this.closed = false;
@@ -1487,7 +1735,7 @@ export class Session {
 
 export async function fetch(
   url: string,
-  options: FetchOptions = {}
+  options: FetchOptions = {},
 ): Promise<TLSResponse> {
   if (options.session) {
     const { session, client: _client, ...requestOptions } = options;

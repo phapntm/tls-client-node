@@ -41,6 +41,7 @@ aliasClient.forward = async (payload) => {
 };
 
 const aliasSession = aliasClient.session({
+    enableCompression: true,
     ja3string: "771,4865-4866-4867,0-11-10,29-23-24,0",
     timeout: 15000,
     hostOverride: "api.example.test",
@@ -58,6 +59,7 @@ assert.equal(aliasPayload.timeoutSeconds, 0);
 assert.equal(aliasPayload.timeoutMilliseconds, 15000);
 assert.equal(aliasPayload.requestHostOverride, "api.example.test");
 assert.equal(aliasPayload.withRandomTLSExtensionOrder, true);
+assert.equal(Object.hasOwn(aliasPayload, "enableCompression"), false);
 
 assert.equal(ClientIdentifier.chrome_130_PSK, "chrome_130_PSK");
 assert.equal(ClientIdentifier.chrome_146, "chrome_146");
@@ -255,6 +257,7 @@ let nativeDestroyAllCalls = 0;
 nativeModule.ensureNativeBinding = async () => ({
     libraryPath: "compat-native-stub",
     async request(payload) {
+        assert.equal(Object.hasOwn(payload, "enableCompression"), false);
         nativeActiveRequests += 1;
         nativeMaxConcurrentRequests = Math.max(nativeMaxConcurrentRequests, nativeActiveRequests);
 
@@ -290,20 +293,23 @@ const nativeClient = new TLSClient({
     runtimeMode: "native",
     requestTimeoutMs: 5_000,
 });
+const compressionNativeSession = nativeClient.session({ enableCompression: true });
 
 const startedAt = Date.now();
 
 try {
     const nativeResponses = await Promise.all([
-        nativeClient.request("https://api.example.test/native-one", {
+        compressionNativeSession.get("https://api.example.test/native-one", {
             forceHttp1: true,
             insecureSkipVerify: true,
         }),
         nativeClient.request("https://api.example.test/native-two", {
+            enableCompression: false,
             forceHttp1: true,
             insecureSkipVerify: true,
         }),
         nativeClient.request("https://api.example.test/native-three", {
+            enableCompression: true,
             forceHttp1: true,
             insecureSkipVerify: true,
         }),
@@ -376,5 +382,6 @@ console.log(JSON.stringify({
         "native concurrency",
         "cookieJar expires forwarding",
         "concurrent session close",
+        "WebSocket compression excluded from HTTP/native payloads",
     ],
 }));
