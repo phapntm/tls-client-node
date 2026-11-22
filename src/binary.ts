@@ -1,10 +1,19 @@
-import { access, chmod, mkdir, readdir, writeFile } from "fs/promises";
+import { randomUUID } from "crypto";
+import {
+  access,
+  chmod,
+  mkdir,
+  readdir,
+  rename,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import path from "path";
 import { BinaryInfo, NativeLibraryInfo, TLSClientOptions } from "./types";
 import { TLSClientError } from "./errors";
 
 const TLS_CLIENT_API_RELEASES =
-  "https://api.github.com/repos/phapntm/tls-client-api/releases"; 
+  "https://api.github.com/repos/phapntm/tls-client-api/releases";
 const TLS_CLIENT_RELEASES =
   "https://api.github.com/repos/bogdanfinn/tls-client/releases";
 
@@ -19,14 +28,42 @@ interface ExistingAsset {
   version: string;
 }
 
+// Shared across clients in this process; completed/failed work is never retained.
+const pendingAssets = new Map<string, Promise<ExistingAsset>>();
+const pendingDownloads = new Map<string, Promise<void>>();
+
+function sharePending<T>(
+  pending: Map<string, Promise<T>>,
+  key: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const existing = pending.get(key);
+  if (existing) {
+    return existing;
+  }
+
+  const task = Promise.resolve()
+    .then(operation)
+    .finally(() => {
+      pending.delete(key);
+    });
+  pending.set(key, task);
+  return task;
+}
+
+function downloadPathKey(filePath: string): string {
+  const resolved = path.resolve(filePath);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
 export function supportsNativeRuntime(
   platform = process.platform,
-  arch = process.arch
+  arch = process.arch,
 ): boolean {
   return (
-    (platform === "win32" && (arch === "x64" || arch === "ia32"))
-    || (platform === "darwin" && (arch === "arm64" || arch === "x64"))
-    || (platform === "linux" && (arch === "x64" || arch === "arm64"))
+    (platform === "win32" && (arch === "x64" || arch === "ia32")) ||
+    (platform === "darwin" && (arch === "arm64" || arch === "x64")) ||
+    (platform === "linux" && (arch === "x64" || arch === "arm64"))
   );
 }
 
@@ -76,7 +113,7 @@ function getApiBinaryAssetSpec(): ReleaseAssetSpec {
 
   throw new TLSClientError(
     `Unsupported platform for tls-client-api: ${platform}/${arch}`,
-    { code: "ERR_UNSUPPORTED_PLATFORM" }
+    { code: "ERR_UNSUPPORTED_PLATFORM" },
   );
 }
 
@@ -134,12 +171,12 @@ function getNativeLibraryAssetSpec(): ReleaseAssetSpec {
 
   throw new TLSClientError(
     `Unsupported platform for tls-client native library: ${platform}/${arch}`,
-    { code: "ERR_UNSUPPORTED_PLATFORM" }
+    { code: "ERR_UNSUPPORTED_PLATFORM" },
   );
 }
 
 function getDefaultDownloadDir(options: TLSClientOptions): string {
-  return options.downloadDir ?? path.resolve(__dirname, "..", "bin");
+  return path.resolve(options.downloadDir ?? path.join(__dirname, "..", "bin"));
 }
 
 function normalizeVersion(version: string): string {
@@ -162,11 +199,12 @@ function createHeaders(token?: string): Record<string, string> {
 async function fetchReleaseMetadata(
   releaseBaseUrl: string,
   version: string | undefined,
-  token?: string 
+  token?: string,
 ): Promise<any> {
-  const url = version && version !== "latest"
-    ? `${releaseBaseUrl}/tags/v${normalizeVersion(version)}`
-    : `${releaseBaseUrl}/latest`;
+  const url =
+    version && version !== "latest"
+      ? `${releaseBaseUrl}/tags/v${normalizeVersion(version)}`
+      : `${releaseBaseUrl}/latest`;
 
   const response = await globalThis.fetch(url, {
     headers: createHeaders(token),
@@ -175,7 +213,7 @@ async function fetchReleaseMetadata(
   if (!response.ok) {
     throw new TLSClientError(
       `Failed to resolve release metadata: ${response.status} ${response.statusText}`,
-      { code: "ERR_RELEASE_LOOKUP", status: response.status }
+      { code: "ERR_RELEASE_LOOKUP", status: response.status },
     );
   }
 
@@ -194,7 +232,7 @@ async function fileExists(filePath: string): Promise<boolean> {
 async function findExistingAsset(
   directory: string,
   assetSpec: ReleaseAssetSpec,
-  requestedVersion?: string
+  requestedVersion?: string,
 ): Promise<ExistingAsset | null> {
   if (!(await fileExists(directory))) {
     return null;
@@ -204,7 +242,7 @@ async function findExistingAsset(
   const matches = entries
     .filter(
       (entry) =>
-        entry.startsWith(assetSpec.prefix) && entry.endsWith(assetSpec.suffix)
+        entry.startsWith(assetSpec.prefix) && entry.endsWith(assetSpec.suffix),
     )
     .sort();
 
@@ -219,7 +257,8 @@ async function findExistingAsset(
   const selected = normalizedVersion
     ? matches.find(
         (entry) =>
-          entry === `${assetSpec.prefix}${normalizedVersion}${assetSpec.suffix}`
+          entry ===
+          `${assetSpec.prefix}${normalizedVersion}${assetSpec.suffix}`,
       )
     : matches[matches.length - 1];
 
@@ -231,38 +270,121 @@ async function findExistingAsset(
     filePath: path.join(directory, selected),
     version: selected.slice(
       assetSpec.prefix.length,
-      selected.length - assetSpec.suffix.length
+      selected.length - assetSpec.suffix.length,
     ),
   };
 }
 
 async function downloadBinaryAsset(
   assetUrl: string,
-  destinationPath: string
+  destinationPath: string,
+  reuseExisting: boolean,
 ): Promise<void> {
-  const response = await globalThis.fetch(assetUrl, {
-    headers: {
-      "User-Agent": "tls-client-node",
+  return sharePending(
+    pendingDownloads,
+    downloadPathKey(destinationPath),
+    async () => {
+      // Another request may have published the same version during metadata lookup.
+      if (reuseExisting && (await fileExists(destinationPath))) {
+        return;
+      }
+
+      const response = await globalThis.fetch(assetUrl, {
+        headers: {
+          "User-Agent": "tls-client-node",
+        },
+      });
+
+      if (!response.ok) {
+        throw new TLSClientError(
+          `Failed to download release asset: ${response.status} ${response.statusText}`,
+          { code: "ERR_BINARY_DOWNLOAD", status: response.status },
+        );
+      }
+
+      // The leading dot also keeps temporary files out of Linux's suffix-less scan.
+      const temporaryPath = path.join(
+        path.dirname(destinationPath),
+        `.${path.basename(destinationPath)}.${randomUUID()}.tmp`,
+      );
+
+      try {
+        const arrayBuffer = await response.arrayBuffer();
+        await writeFile(temporaryPath, Buffer.from(arrayBuffer), {
+          flag: "wx",
+        });
+
+        if (process.platform !== "win32") {
+          await chmod(temporaryPath, 0o755);
+        }
+
+        await rename(temporaryPath, destinationPath);
+      } finally {
+        await unlink(temporaryPath).catch(() => undefined);
+      }
     },
-  });
+  );
+}
 
-  if (!response.ok) {
-    throw new TLSClientError(
-      `Failed to download release asset: ${response.status} ${response.statusText}`,
-      { code: "ERR_BINARY_DOWNLOAD", status: response.status }
+async function ensureReleaseAsset(
+  options: TLSClientOptions,
+  assetSpec: ReleaseAssetSpec,
+  description: string,
+): Promise<ExistingAsset> {
+  const directory = getDefaultDownloadDir(options);
+  const key = JSON.stringify([
+    downloadPathKey(directory),
+    assetSpec.releaseBaseUrl,
+    assetSpec.prefix,
+    assetSpec.suffix,
+    options.version === undefined ? null : normalizeVersion(options.version),
+    options.githubToken ?? null,
+  ]);
+
+  return sharePending(pendingAssets, key, async () => {
+    await mkdir(directory, { recursive: true });
+    const existing = await findExistingAsset(
+      directory,
+      assetSpec,
+      options.version,
     );
-  }
+    if (existing) {
+      return existing;
+    }
 
-  const arrayBuffer = await response.arrayBuffer();
-  await writeFile(destinationPath, Buffer.from(arrayBuffer));
+    const metadata = await fetchReleaseMetadata(
+      assetSpec.releaseBaseUrl,
+      options.version,
+      options.githubToken,
+    );
+    const version = normalizeVersion(
+      metadata.tag_name ?? options.version ?? "latest",
+    );
+    const assetName = `${assetSpec.prefix}${version}${assetSpec.suffix}`;
+    const asset = metadata.assets?.find(
+      (entry: { name: string }) => entry.name === assetName,
+    );
 
-  if (process.platform !== "win32") {
-    await chmod(destinationPath, 0o755);
-  }
+    if (!asset?.browser_download_url) {
+      throw new TLSClientError(
+        `No ${description} release asset found for ${assetName}`,
+        { code: "ERR_BINARY_ASSET_MISSING" },
+      );
+    }
+
+    const destinationPath = path.join(directory, assetName);
+    await downloadBinaryAsset(
+      asset.browser_download_url,
+      destinationPath,
+      options.version !== "latest",
+    );
+
+    return { filePath: destinationPath, version };
+  });
 }
 
 export async function ensureBinary(
-  options: TLSClientOptions = {}
+  options: TLSClientOptions = {},
 ): Promise<BinaryInfo> {
   if (options.binaryPath) {
     return {
@@ -271,47 +393,16 @@ export async function ensureBinary(
     };
   }
 
-  const directory = getDefaultDownloadDir(options);
-  await mkdir(directory, { recursive: true });
-  const assetSpec = getApiBinaryAssetSpec();
-
-  const existing = await findExistingAsset(directory, assetSpec, options.version);
-  if (existing) {
-    return {
-      executablePath: existing.filePath,
-      version: existing.version,
-    };
-  }
-
-  const metadata = await fetchReleaseMetadata(
-    assetSpec.releaseBaseUrl,
-    options.version,
-    options.githubToken 
+  const asset = await ensureReleaseAsset(
+    options,
+    getApiBinaryAssetSpec(),
+    "tls-client-api",
   );
-  const version = normalizeVersion(metadata.tag_name ?? options.version ?? "latest");
-  const assetName = `${assetSpec.prefix}${version}${assetSpec.suffix}`;
-  const asset = metadata.assets?.find(
-    (entry: { name: string }) => entry.name === assetName
-  );
-
-  if (!asset?.browser_download_url) {
-    throw new TLSClientError(
-      `No tls-client-api release asset found for ${assetName}`,
-      { code: "ERR_BINARY_ASSET_MISSING" }
-    );
-  }
-
-  const destinationPath = path.join(directory, assetName);
-  await downloadBinaryAsset(asset.browser_download_url, destinationPath);
-
-  return {
-    executablePath: destinationPath,
-    version,
-  };
+  return { executablePath: asset.filePath, version: asset.version };
 }
 
 export async function ensureNativeLibrary(
-  options: TLSClientOptions = {}
+  options: TLSClientOptions = {},
 ): Promise<NativeLibraryInfo> {
   if (options.nativeLibraryPath) {
     return {
@@ -320,50 +411,19 @@ export async function ensureNativeLibrary(
     };
   }
 
-  const directory = getDefaultDownloadDir(options);
-  await mkdir(directory, { recursive: true });
-  const assetSpec = getNativeLibraryAssetSpec();
-
-  const existing = await findExistingAsset(directory, assetSpec, options.version);
-  if (existing) {
-    return {
-      libraryPath: existing.filePath,
-      version: existing.version,
-    };
-  }
-
-  const metadata = await fetchReleaseMetadata(
-    assetSpec.releaseBaseUrl,
-    options.version,
-    options.githubToken
+  const asset = await ensureReleaseAsset(
+    options,
+    getNativeLibraryAssetSpec(),
+    "tls-client",
   );
-  const version = normalizeVersion(metadata.tag_name ?? options.version ?? "latest");
-  const assetName = `${assetSpec.prefix}${version}${assetSpec.suffix}`;
-  const asset = metadata.assets?.find(
-    (entry: { name: string }) => entry.name === assetName
-  );
-
-  if (!asset?.browser_download_url) {
-    throw new TLSClientError(
-      `No tls-client release asset found for ${assetName}`,
-      { code: "ERR_BINARY_ASSET_MISSING" }
-    );
-  }
-
-  const destinationPath = path.join(directory, assetName);
-  await downloadBinaryAsset(asset.browser_download_url, destinationPath);
-
-  return {
-    libraryPath: destinationPath,
-    version,
-  };
+  return { libraryPath: asset.filePath, version: asset.version };
 }
 
 export async function writeConfigFile(
   directory: string,
   port: number,
   healthPort: number,
-  apiKey: string
+  apiKey: string,
 ): Promise<string> {
   await mkdir(directory, { recursive: true });
 

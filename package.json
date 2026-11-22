@@ -46,12 +46,12 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "smoke:downloads": "node ./scripts/validate-binary-downloads.mjs",
     "smoke:exports": "node ./scripts/validate-exports.mjs",
     "smoke:compat": "node ./scripts/validate-compat.mjs",
     "smoke:websocket": "node ./scripts/validate-websocket.mjs",
     "smoke:socketio": "node ./scripts/validate-socketio-adapter.mjs",
-    "smoke:axios": "node ./scripts/validate-axios-adapter.mjs",
-    "test": "yarn smoke:exports && yarn smoke:compat && yarn smoke:websocket && yarn smoke:socketio && yarn smoke:axios",
+    "test": "yarn smoke:downloads && yarn smoke:exports && yarn smoke:compat && yarn smoke:websocket && yarn smoke:socketio",
     "ci:check": "yarn build && yarn test && yarn pack:check",
     "prepare": "yarn build",
     "pack:check": "npm pack --dry-run",
@@ -78,7 +78,6 @@
     "access": "public"
   },
   "dependencies": {
-    "axios": "^1",
     "koffi": "^2.8.9",
     "tough-cookie": "^6.0.1",
     "ws": "^8.18.0"

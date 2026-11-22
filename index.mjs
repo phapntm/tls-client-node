@@ -6,7 +6,6 @@ export const {
   CookieJar,
   MultipartForm,
   createMultipartForm,
-  createTLSAdapter,
   TLSClient,
   Session,
   fetch,

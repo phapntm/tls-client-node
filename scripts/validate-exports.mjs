@@ -16,7 +16,6 @@ const requiredExports = [
   "CookieJar",
   "MultipartForm",
   "createMultipartForm",
-  "createTLSAdapter",
   "TLSClient",
   "Session",
   "fetch",
@@ -58,13 +57,6 @@ if (
   typeof esmModule.TLSWebSocket !== "function"
 ) {
   throw new Error("TLSWebSocket export is not a constructor.");
-}
-
-if (
-  typeof cjsModule.createTLSAdapter !== "function" ||
-  cjsModule.createTLSAdapter !== esmModule.createTLSAdapter
-) {
-  throw new Error("Axios adapter factory exports are invalid or inconsistent.");
 }
 
 const cjsSocketIoModule = require(path.join(rootDir, "dist", "socket-io.js"));

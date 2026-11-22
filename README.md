@@ -220,6 +220,10 @@ await client.stop();
 
 Default local mode is managed `tls-client-api`.
 
+Concurrent clients in the same Node.js process share an in-progress binary download. Matching release lookups are shared too, and requests that resolve to the same destination file wait for the same download. Different versions, download directories, and API/native assets remain independent. A failed download rejects its waiting callers and can be retried on the next startup.
+
+Files are published only after downloading, writing, and setting executable permissions have completed. Each client still owns its own runtime. This sharing applies to clients using the same loaded package instance; separate processes or worker threads do not share the in-memory download queue. Install-time `postinstall` downloads are unchanged.
+
 Use native mode only when you explicitly want direct shared-library loading:
 
 ```ts
