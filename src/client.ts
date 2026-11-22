@@ -1,12 +1,10 @@
 import { randomBytes, randomUUID } from "crypto";
 import {
-  access,
   chmod,
   copyFile,
   mkdir,
-  open,
-  readFile,
-  rm,
+  rename,
+  stat,
   unlink,
   writeFile,
 } from "fs/promises";
@@ -20,6 +18,7 @@ import { ensureBinary, supportsNativeRuntime, writeConfigFile } from "./binary";
 import { TLSClientError } from "./errors";
 import { ensureNativeBinding, NativeClientBinding } from "./native";
 import { TLSResponse } from "./response";
+import { claimRuntimeLock, type RuntimeLock } from "./runtime-lock";
 import {
   buildBridgeWebSocketUrl,
   encodeWebSocketBridgeConfig,
@@ -52,8 +51,9 @@ interface RuntimeState {
   native?: NativeClientBinding;
   child?: ChildProcess;
   runtimeDir?: string;
-  lockFilePath?: string;
+  lock?: RuntimeLock;
   configFilePath?: string;
+  failure?: TLSClientError;
 }
 
 export interface FetchOptions extends RequestOptions {
@@ -815,15 +815,6 @@ function shouldUseNativeRuntime(options: TLSClientOptions): boolean {
   return false;
 }
 
-async function pathExists(filePath: string): Promise<boolean> {
-  try {
-    await access(filePath);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function getRuntimeRootDirectory(options: TLSClientOptions): string {
   if (options.runtimeDir) {
     return options.runtimeDir;
@@ -852,67 +843,43 @@ function getRuntimeRootDirectory(options: TLSClientOptions): string {
   );
 }
 
-async function releaseRuntimeLock(lockFilePath?: string): Promise<void> {
-  if (!lockFilePath) {
-    return;
+function managedRuntimeFailure(runtime: RuntimeState): TLSClientError | undefined {
+  if (runtime.mode !== "managed") {
+    return undefined;
   }
-
-  await rm(lockFilePath, { force: true });
+  const child = runtime.child;
+  if (!runtime.failure && child && (child.exitCode !== null || child.signalCode !== null)) {
+    runtime.failure = new TLSClientError("The managed tls-client-api runtime has exited.", {
+      code: "ERR_RUNTIME_EXITED",
+      details: { pid: child.pid, exitCode: child.exitCode, signal: child.signalCode },
+    });
+  }
+  return runtime.failure;
 }
 
-function isProcessAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) {
-    return false;
-  }
-
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function claimRuntimeLock(lockFilePath: string): Promise<boolean> {
-  try {
-    const handle = await open(lockFilePath, "wx");
-    await handle.writeFile(String(process.pid), "utf8");
-    await handle.close();
-    return true;
-  } catch (error) {
-    const nodeError = error as NodeJS.ErrnoException;
-    if (nodeError.code !== "EEXIST") {
+async function prepareRuntimeExecutable(source: string, destination: string): Promise<void> {
+  const sourceInfo = await stat(source);
+  const destinationInfo = await stat(destination).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "ENOENT") {
       throw error;
     }
+    return undefined;
+  });
+  if (destinationInfo?.isFile() && destinationInfo.size === sourceInfo.size) {
+    return;
   }
-
+  const temporaryPath = path.join(
+    path.dirname(destination),
+    `.${path.basename(destination)}.${randomUUID()}.tmp`,
+  );
   try {
-    const existingPid = Number.parseInt(
-      (await readFile(lockFilePath, "utf8")).trim(),
-      10,
-    );
-
-    if (isProcessAlive(existingPid)) {
-      return false;
+    await copyFile(source, temporaryPath);
+    if (process.platform !== "win32") {
+      await chmod(temporaryPath, 0o755);
     }
-  } catch {
-    // Treat unreadable lock files as stale and replace them.
-  }
-
-  await rm(lockFilePath, { force: true });
-
-  try {
-    const handle = await open(lockFilePath, "wx");
-    await handle.writeFile(String(process.pid), "utf8");
-    await handle.close();
-    return true;
-  } catch (error) {
-    const nodeError = error as NodeJS.ErrnoException;
-    if (nodeError.code === "EEXIST") {
-      return false;
-    }
-
-    throw error;
+    await rename(temporaryPath, destination);
+  } finally {
+    await unlink(temporaryPath).catch(() => undefined);
   }
 }
 
@@ -923,7 +890,7 @@ async function prepareRuntimeSlot(
 ): Promise<{
   runtimeDir: string;
   runtimeExecutablePath: string;
-  lockFilePath: string;
+  lock: RuntimeLock;
 }> {
   if (process.platform === "win32" && !options.runtimeDir) {
     const runtimeDir = path.dirname(executablePath);
@@ -932,7 +899,8 @@ async function prepareRuntimeSlot(
       `.${path.basename(executablePath)}.lock`,
     );
 
-    if (!(await claimRuntimeLock(lockFilePath))) {
+    const lock = await claimRuntimeLock(lockFilePath);
+    if (!lock) {
       throw new TLSClientError(
         "The managed tls-client-api Windows runtime is already in use.",
         { code: "ERR_RUNTIME_SLOT_UNAVAILABLE" },
@@ -942,7 +910,7 @@ async function prepareRuntimeSlot(
     return {
       runtimeDir,
       runtimeExecutablePath: executablePath,
-      lockFilePath,
+      lock,
     };
   }
 
@@ -960,29 +928,24 @@ async function prepareRuntimeSlot(
 
     await mkdir(runtimeDir, { recursive: true });
 
-    if (!(await claimRuntimeLock(lockFilePath))) {
+    const lock = await claimRuntimeLock(lockFilePath);
+    if (!lock) {
       continue;
     }
 
     const runtimeExecutablePath = path.join(runtimeDir, executableName);
 
     try {
-      if (!(await pathExists(runtimeExecutablePath))) {
-        await copyFile(executablePath, runtimeExecutablePath);
-
-        if (process.platform !== "win32") {
-          await chmod(runtimeExecutablePath, 0o755);
-        }
-      }
+      await prepareRuntimeExecutable(executablePath, runtimeExecutablePath);
     } catch (error) {
-      await releaseRuntimeLock(lockFilePath);
+      await lock.release();
       throw error;
     }
 
     return {
       runtimeDir,
       runtimeExecutablePath,
-      lockFilePath,
+      lock,
     };
   }
 
@@ -993,7 +956,7 @@ async function prepareRuntimeSlot(
 }
 
 async function stopChildProcess(child?: ChildProcess): Promise<void> {
-  if (!child) {
+  if (!child?.pid) {
     return;
   }
 
@@ -1001,18 +964,41 @@ async function stopChildProcess(child?: ChildProcess): Promise<void> {
     return;
   }
 
-  const exitPromise = new Promise<void>((resolve) => {
-    child.once("exit", () => resolve());
+  const signalAndWait = (signal: NodeJS.Signals) => new Promise<boolean>((resolve, reject) => {
+    const finish = (exited: boolean) => {
+      clearTimeout(timer);
+      child.off("exit", onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const timer = setTimeout(() => finish(false), 5_000);
+    child.once("exit", onExit);
+    try {
+      child.kill(signal);
+      if (child.exitCode !== null || child.signalCode !== null) {
+        finish(true);
+      }
+    } catch (error) {
+      clearTimeout(timer);
+      child.off("exit", onExit);
+      reject(error);
+    }
   });
 
-  child.kill();
-
-  await Promise.race([exitPromise, delay(5_000)]);
-
-  if (child.exitCode === null && child.signalCode === null) {
-    child.kill("SIGKILL");
-    await Promise.race([exitPromise, delay(5_000)]);
+  if (!(await signalAndWait("SIGTERM")) && !(await signalAndWait("SIGKILL"))) {
+    throw new TLSClientError("Unable to stop the managed tls-client-api runtime.", {
+      code: "ERR_RUNTIME_STOP_TIMEOUT",
+      details: { pid: child.pid },
+    });
   }
+}
+
+async function disposeManagedRuntime(runtime: RuntimeState): Promise<void> {
+  await stopChildProcess(runtime.child);
+  if (runtime.configFilePath) {
+    await unlink(runtime.configFilePath).catch(() => undefined);
+  }
+  await runtime.lock?.release();
 }
 
 async function findAvailablePort(preferred?: number): Promise<number> {
@@ -1059,6 +1045,7 @@ export class TLSClient {
   > &
     TLSClientOptions;
   private startPromise?: Promise<void>;
+  private stopPromise?: Promise<void>;
   private runtime?: RuntimeState;
 
   constructor(options: TLSClientOptions = {}) {
@@ -1070,11 +1057,14 @@ export class TLSClient {
   }
 
   public async start(): Promise<void> {
-    if (this.runtime) {
-      return;
+    if (this.stopPromise) {
+      await this.stopPromise;
     }
 
     if (!this.startPromise) {
+      if (this.runtime && !managedRuntimeFailure(this.runtime)) {
+        return;
+      }
       this.startPromise = this.startInternal().finally(() => {
         this.startPromise = undefined;
       });
@@ -1084,23 +1074,30 @@ export class TLSClient {
   }
 
   public async stop(): Promise<void> {
-    if (!this.runtime) {
+    if (!this.stopPromise) {
+      this.stopPromise = this.stopInternal().finally(() => {
+        this.stopPromise = undefined;
+      });
+    }
+    await this.stopPromise;
+  }
+
+  private async stopInternal(): Promise<void> {
+    // A stop during bootstrap must also stop the child that is still starting.
+    await this.startPromise?.catch(() => undefined);
+    const runtime = this.runtime;
+    if (!runtime) {
       return;
     }
 
-    if (this.runtime.mode === "native") {
-      await this.runtime.native?.destroyAll<DestroyOutput>();
+    if (runtime.mode === "native") {
+      await runtime.native?.destroyAll<DestroyOutput>();
+    } else {
+      await disposeManagedRuntime(runtime);
+    }
+    if (this.runtime === runtime) {
       this.runtime = undefined;
-      return;
     }
-
-    await stopChildProcess(this.runtime.child);
-    if (this.runtime.configFilePath) {
-      await unlink(this.runtime.configFilePath).catch(() => undefined);
-    }
-    await releaseRuntimeLock(this.runtime.lockFilePath);
-
-    this.runtime = undefined;
   }
 
   public session(options: SessionOptions = {}): Session {
@@ -1202,6 +1199,13 @@ export class TLSClient {
   }
 
   private async startInternal(): Promise<void> {
+    const previous = this.runtime;
+    if (previous) {
+      await disposeManagedRuntime(previous);
+      if (this.runtime === previous) {
+        this.runtime = undefined;
+      }
+    }
     if (this.options.baseUrl) {
       this.runtime = {
         mode: "remote",
@@ -1230,77 +1234,87 @@ export class TLSClient {
     ) {
       const port = await findAvailablePort(this.options.port);
       const healthPort = await findAvailablePort(this.options.healthPort);
-      const { runtimeDir, runtimeExecutablePath, lockFilePath } =
+      const { runtimeDir, runtimeExecutablePath, lock } =
         await prepareRuntimeSlot(
           this.options,
           binary.executablePath,
           binary.version,
         );
-      const configFilePath = await writeConfigFile(
-        runtimeDir,
-        port,
-        healthPort,
-        apiKey,
-      );
-
-      const child = spawn(runtimeExecutablePath, [], {
-        stdio: ["ignore", "pipe", "pipe"],
-        cwd: runtimeDir,
-        windowsHide: true,
-      });
-
       let stdout = "";
       let stderr = "";
-      let exitCode: number | null = null;
-      let exitSignal: NodeJS.Signals | null = null;
-
-      const onStdoutData = (chunk: Buffer | string) => {
-        stdout = appendBoundedLog(stdout, chunk);
-      };
-      const onStderrData = (chunk: Buffer | string) => {
-        stderr = appendBoundedLog(stderr, chunk);
-      };
-      const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
-        exitCode = code;
-        exitSignal = signal;
-      };
-
-      child.stdout.on("data", onStdoutData);
-      child.stderr.on("data", onStderrData);
-      child.on("exit", onExit);
-
-      const detachStartupListeners = () => {
-        child.stdout.off("data", onStdoutData);
-        child.stderr.off("data", onStderrData);
-        child.off("exit", onExit);
-      };
-
       const runtime: RuntimeState = {
         mode: "managed",
         baseUrl: `http://127.0.0.1:${port}`,
         apiKey,
-        child,
         runtimeDir,
-        lockFilePath,
-        configFilePath,
+        lock,
       };
-
-      this.runtime = runtime;
-
+      let detachStartupListeners = () => {};
       try {
-        await this.waitUntilReady();
+        runtime.configFilePath = path.join(runtimeDir, "config.dist.yml");
+        runtime.configFilePath = await writeConfigFile(runtimeDir, port, healthPort, apiKey);
+        const child = spawn(runtimeExecutablePath, [], {
+          stdio: ["ignore", "pipe", "pipe"],
+          cwd: runtimeDir,
+          windowsHide: true,
+        });
+        runtime.child = child;
+        child.on("error", (error) => {
+          runtime.failure = new TLSClientError("The managed tls-client-api process failed.", {
+            code: "ERR_RUNTIME_EXITED",
+            cause: error,
+            details: { pid: child.pid },
+          });
+        });
+        child.once("exit", (exitCode, signal) => {
+          runtime.failure ??= new TLSClientError("The managed tls-client-api runtime has exited.", {
+            code: "ERR_RUNTIME_EXITED",
+            details: { pid: child.pid, exitCode, signal },
+          });
+        });
+
+        const onStdoutData = (chunk: Buffer | string) => {
+          stdout = appendBoundedLog(stdout, chunk);
+        };
+        const onStderrData = (chunk: Buffer | string) => {
+          stderr = appendBoundedLog(stderr, chunk);
+        };
+        child.stdout?.on("data", onStdoutData);
+        child.stderr?.on("data", onStderrData);
+        detachStartupListeners = () => {
+          child.stdout?.off("data", onStdoutData);
+          child.stderr?.off("data", onStderrData);
+          child.stdout?.resume();
+          child.stderr?.resume();
+        };
+
+        await this.waitUntilReady(runtime);
+        const failure = managedRuntimeFailure(runtime);
+        if (failure) {
+          throw failure;
+        }
+        this.runtime = runtime;
         detachStartupListeners();
         return;
       } catch (error) {
         detachStartupListeners();
-        await stopChildProcess(child);
-        await unlink(configFilePath).catch(() => undefined);
-        await releaseRuntimeLock(lockFilePath);
-        this.runtime = undefined;
+        try {
+          await disposeManagedRuntime(runtime);
+        } catch (cleanupError) {
+          // Keep ownership available for stop()/the next start() to retry.
+          runtime.failure = new TLSClientError("Unable to clean up the managed runtime.", {
+            code: "ERR_RUNTIME_CLEANUP",
+            cause: cleanupError,
+          });
+          this.runtime = runtime;
+          throw runtime.failure;
+        }
 
         const startupOutput = [stdout.trim(), stderr.trim()]
           .filter(Boolean)
           .join("\n");
+        const exitCode = runtime.child?.exitCode ?? null;
+        const exitSignal = runtime.child?.signalCode ?? null;
         const startupError = new TLSClientError(
           startupOutput
             ? `tls-client-api failed to start: ${startupOutput}`
@@ -1331,17 +1345,34 @@ export class TLSClient {
     );
   }
 
-  private async waitUntilReady(): Promise<void> {
-    const startedAt = Date.now();
+  private async waitUntilReady(runtime: RuntimeState): Promise<void> {
+    const deadline = Date.now() + this.options.startupTimeoutMs;
     let waitMs = 50;
-    while (Date.now() - startedAt < this.options.startupTimeoutMs) {
+    let lastError: unknown;
+    while (Date.now() < deadline) {
+      const failure = managedRuntimeFailure(runtime);
+      if (failure) {
+        throw failure;
+      }
       try {
-        await this.requestJson<DestroyOutput>("/api/free-session", {
-          sessionId: "tls-client-healthcheck",
-        });
+        // Bootstrap uses its candidate directly: it must not recurse into
+        // start(), and ordinary requests must not see it until it is ready.
+        await this.requestJsonForRuntime<DestroyOutput>(
+          runtime,
+          "/api/free-session",
+          { sessionId: "tls-client-healthcheck" },
+          "POST",
+          undefined,
+          Math.max(1, Math.min(this.options.requestTimeoutMs, deadline - Date.now())),
+        );
         return;
-      } catch {
-        await delay(waitMs);
+      } catch (error) {
+        const failure = managedRuntimeFailure(runtime);
+        if (failure) {
+          throw failure;
+        }
+        lastError = error;
+        await delay(Math.max(0, Math.min(waitMs, deadline - Date.now())));
         waitMs = Math.min(waitMs * 2, 500);
       }
     }
@@ -1350,6 +1381,7 @@ export class TLSClient {
       "Timed out waiting for tls-client-api to become ready.",
       {
         code: "ERR_STARTUP_TIMEOUT",
+        cause: lastError,
       },
     );
   }
@@ -1360,7 +1392,10 @@ export class TLSClient {
         code: "ERR_NOT_STARTED",
       });
     }
-
+    const failure = managedRuntimeFailure(this.runtime);
+    if (failure) {
+      throw failure;
+    }
     return this.runtime;
   }
 
@@ -1400,6 +1435,21 @@ export class TLSClient {
   ): Promise<T> {
     await this.start();
     const runtime = this.getRuntime();
+    return this.requestJsonForRuntime<T>(runtime, pathName, body, method, endpointOverride);
+  }
+
+  private async requestJsonForRuntime<T>(
+    runtime: RuntimeState,
+    pathName: string,
+    body: unknown,
+    method = "POST",
+    endpointOverride?: string,
+    timeoutMs = this.options.requestTimeoutMs,
+  ): Promise<T> {
+    const failure = managedRuntimeFailure(runtime);
+    if (failure) {
+      throw failure;
+    }
     if (runtime.mode === "native") {
       throw new TLSClientError(
         `The ${pathName} endpoint is not available in native-library mode.`,
@@ -1412,7 +1462,7 @@ export class TLSClient {
     const controller = new AbortController();
     const timer = setTimeout(
       () => controller.abort(),
-      this.options.requestTimeoutMs,
+      timeoutMs,
     );
 
     try {
@@ -1443,13 +1493,21 @@ export class TLSClient {
 
       return JSON.parse(text) as T;
     } catch (error) {
+      const failure = managedRuntimeFailure(runtime);
+      if (failure) {
+        throw new TLSClientError(failure.message, {
+          code: failure.code,
+          details: failure.details,
+          cause: error,
+        });
+      }
       if (
         error instanceof Error &&
         (error.name === "AbortError" ||
           (error as NodeJS.ErrnoException).code === "ABORT_ERR")
       ) {
         throw new TLSClientError(
-          `tls-client-api request timed out after ${this.options.requestTimeoutMs}ms`,
+          `tls-client-api request timed out after ${timeoutMs}ms`,
           { code: "ERR_REQUEST_TIMEOUT", retriable: true },
         );
       }

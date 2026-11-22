@@ -220,6 +220,10 @@ await client.stop();
 
 Default local mode is managed `tls-client-api`.
 
+Requests and WebSockets start their client automatically and wait for the API healthcheck to succeed. Concurrent operations on one client share the same startup, so calling `await client.start()` explicitly is optional. A failed startup releases its slot and can be retried by the next operation. `client.stop()` also waits for an ongoing startup before stopping its child process.
+
+If a managed API process exits, the next operation cleans up that runtime and starts a replacement. Requests already in progress are not replayed automatically, and existing WebSockets must reconnect. Backend sessions and connection pools belong to the exited process; a replacement starts with fresh backend state.
+
 Concurrent clients in the same Node.js process share an in-progress binary download. Matching release lookups are shared too, and requests that resolve to the same destination file wait for the same download. Different versions, download directories, and API/native assets remain independent. A failed download rejects its waiting callers and can be retried on the next startup.
 
 Files are published only after downloading, writing, and setting executable permissions have completed. Each client still owns its own runtime. This sharing applies to clients using the same loaded package instance; separate processes or worker threads do not share the in-memory download queue. Install-time `postinstall` downloads are unchanged.
@@ -247,7 +251,9 @@ const client = new TLSClient({
 
 ### Managed runtime slots
 
-In managed mode each started `TLSClient` claims an isolated **runtime slot** — its own runtime directory, lock file, and `tls-client-api` child process — so multiple clients (and multiple OS processes) never collide on the same files or ports. A single runtime serves many concurrent sessions and requests, so you normally need **one slot per long-lived process**, not one per request.
+In managed mode each started `TLSClient` claims an isolated **runtime slot** with its own executable, configuration, ownership lock, and `tls-client-api` child process. Clients in separate OS processes on the same host use the same slot ownership protocol. A single runtime serves many concurrent sessions and requests, so you normally need **one slot per long-lived process**, not one per request.
+
+The `.lock` path is a non-empty directory published together with its PID and unique ownership marker. Reclaiming or releasing a lock removes only that owner's marker, so a former owner cannot remove a replacement's lock. A process is considered dead only when the operating system reports `ESRCH`; permission failures leave the slot occupied. Executable copies are published only after copying and setting permissions, and a truncated cached copy is replaced on the next startup.
 
 Slots live under the runtime cache, keyed by upstream version:
 
@@ -255,7 +261,7 @@ Slots live under the runtime cache, keyed by upstream version:
 | --- | --- |
 | Linux | `${XDG_CACHE_HOME:-~/.cache}/tls-client-node/runtime/<version>/slot-N/` |
 | macOS | `~/Library/Caches/tls-client-node/runtime/<version>/slot-N/` |
-| Windows | single managed runtime under `%LOCALAPPDATA%\tls-client-node\runtime` (the slot pool applies only when you set `runtimeDir`) |
+| Windows | beside the selected EXE by default; set `runtimeDir` to use the slot pool |
 
 The slot ceiling is resolved as **`runtimeSlots` option → `TLS_CLIENT_RUNTIME_SLOTS` env → default `128`**:
 
@@ -288,14 +294,7 @@ try {
 - **Too many concurrent runtimes** — more started clients (or separate processes) than the slot cap. Reuse a shared client, or raise `TLS_CLIENT_RUNTIME_SLOTS`.
 - **Leaked locks** — a runtime was force-killed (`SIGKILL`, `kill -9`, abrupt container stop) before `client.stop()` ran, leaving a stale `.lock` behind. Stale locks are reclaimed automatically only when the recorded PID is no longer alive, so on busy hosts where PIDs get recycled a dead owner can keep a slot pinned.
 
-To clear stale slots when no runtimes should be active:
-
-```sh
-# Linux/macOS
-pkill -f tls-client-api
-rm -f ~/.cache/tls-client-node/runtime/*/slot-*/.lock           # Linux
-rm -f ~/Library/Caches/tls-client-node/runtime/*/slot-*/.lock   # macOS
-```
+Numeric PID lock files created by earlier versions are respected while their owner is alive and reclaimed after the OS confirms the PID has exited. Empty, malformed, or unreadable legacy lock files remain occupied because their owner cannot be verified. Inspect those paths only after stopping the clients that use them; avoid deleting locks belonging to active clients.
 
 Calling `await client.stop()` (ideally in a `finally`, and on `SIGINT`/`SIGTERM` handlers) prevents leaks in the first place.
 
